@@ -104,6 +104,17 @@ class NpuFaPaAttentionBackend(AttentionBackend):
         # pd_disaggregation
         self.use_pd_disaggregation = int(os.getenv("FLAGS_use_pd_disaggregation", 0))
         self.start_layer_index = fd_config.model_config.start_layer_index
+        self.total_num_heads = num_heads + 2 * kv_num_heads
+        self.total_hidden_dim = self.total_num_heads * head_dim
+        self.dtype = paddle.get_default_dtype()
+        print(f"{self.block_size=}")
+        print(f"{self.speculate_max_draft_token_num=}")
+        print(f"{self.rank=}")
+        print(f"{self.kv_num_heads=}")
+        print(f"{self.num_heads=}")
+        print(f"{self.head_dim=}")
+        print(f"{self.num_layers=}")
+        print(f"{self.start_layer_index=}")
 
     def init_attention_metadata(self, forward_meta):
         """Initialize attntion metadata hence all layers in the forward pass can reuse it."""
@@ -156,6 +167,77 @@ class NpuFaPaAttentionBackend(AttentionBackend):
                 self.rank, self.keep_pd_step_flag
             )
         self.attention_metadata = metadata
+        self.prefill_info_dict = {}
+        self.decode_info_dict = {}
+
+        prefill_non_zeros_ids = forward_meta.seq_lens_this_time > 1
+        decode_non_zeros_ids = forward_meta.seq_lens_this_time == 1 
+        self.prefill_info_dict["batch_ids"] = paddle.where(prefill_non_zeros_ids)[0]
+        self.decode_info_dict["batch_ids"] = paddle.where(decode_non_zeros_ids)[0]
+
+        self.prefill_len = len(self.prefill_info_dict["batch_ids"])
+        self.decode_len = len(self.decode_info_dict["batch_ids"])
+
+        if self.decode_len != 0 and self.prefill_len != 0:
+            prefill_num_tokens = paddle.sum(forward_meta.seq_lens_this_time[prefill_non_zeros_ids])
+            print(f"{prefill_num_tokens=}")
+            decode_num_tokens = paddle.sum(forward_meta.seq_lens_this_time[decode_non_zeros_ids])
+            print(f"{decode_num_tokens=}")
+            self.prefill_qkv = paddle.zeros([prefill_num_tokens, self.total_hidden_dim], dtype=self.dtype)
+            self.decode_qkv = paddle.zeros([decode_num_tokens, self.total_hidden_dim], dtype=self.dtype)
+            self.merged_output = paddle.zeros(
+                [prefill_num_tokens + decode_num_tokens, self.num_heads * self.head_dim], dtype=self.dtype
+            )
+
+            prefill_start, decode_start, start = 0, 0, 0
+            non_zeros_ids = forward_meta.seq_lens_this_time != 0
+            non_zeros_seq_lens = forward_meta.seq_lens_this_time[non_zeros_ids]
+            end = non_zeros_seq_lens[0]
+            if end > 1:
+                last_stage = "prefill"
+                prefill_end = end
+                decode_end = 0
+            else:
+                last_stage = "decode"
+                prefill_end = 0
+                decode_end = end
+
+            self.prefill_info_dict["id_group"] = []
+            self.prefill_info_dict["reverse_id_group"] = []
+            self.decode_info_dict["id_group"] = []
+            self.decode_info_dict["reverse_id_group"] = []
+            self.record_stages = []
+            for seq_len in non_zeros_seq_lens[1:]:
+                if seq_len > 1:
+                    if last_stage == "decode":
+                        self.record_stages.append((last_stage, len(self.decode_info_dict["id_group"])))
+                        self.decode_info_dict["id_group"].append((decode_start, decode_end))
+                        self.decode_info_dict["reverse_id_group"].append((start, end))
+                        decode_start = decode_end
+                        start = end
+                        last_stage = "prefill"
+                    prefill_end += seq_len
+                    end += seq_len
+                else:
+                    if last_stage == "prefill":
+                        self.record_stages.append((last_stage, len(self.prefill_info_dict["id_group"])))
+                        self.prefill_info_dict["id_group"].append((prefill_start, prefill_end))
+                        self.prefill_info_dict["reverse_id_group"].append((start, end))
+                        prefill_start = prefill_end
+                        start = end
+                        last_stage = "decode"
+                    decode_end += seq_len
+                    end += seq_len
+
+            if prefill_start < prefill_end:
+                self.record_stages.append(("prefill", len(self.prefill_info_dict["id_group"])))
+                self.prefill_info_dict["id_group"].append((prefill_start, prefill_end))
+                self.prefill_info_dict["reverse_id_group"].append((start, end))
+            if decode_start < decode_end:
+                self.record_stages.append(("decode", len(self.decode_info_dict["id_group"])))
+                self.decode_info_dict["id_group"].append((decode_start, decode_end))
+                self.decode_info_dict["reverse_id_group"].append((start, end))
+
 
     def get_attntion_meta(self):
         """get_attntion_meta"""
@@ -171,6 +253,68 @@ class NpuFaPaAttentionBackend(AttentionBackend):
         Caculate kv cache shape
         """
         return (max_num_blocks, self.kv_num_heads, self.block_size, self.head_dim)
+
+    def forward_prefill(self, decode_qkv, rope_emb, cache_k, cache_v, 
+                        seq_lens_encoder, block_tables, q_num_head, 
+                        kv_num_head, head_dim, max_seq_len, block_size):
+        seq_lens_decoder = paddle.zeros_like(seq_lens_encoder)
+        res = fused_fapa_attention_npu(
+            decode_qkv,  
+            rope_emb,
+            cache_k,
+            cache_v,
+            seq_lens_encoder,
+            seq_lens_decoder,
+            block_tables,
+            q_num_head,
+            kv_num_head,
+            head_dim,
+            max_seq_len,
+            block_size,
+            )
+        return res
+
+
+    def forward_decode(self, decode_qkv, rope_emb, cache_k, cache_v, 
+                       seq_lens_decoder, block_tables, q_num_head, 
+                       kv_num_head, head_dim, max_seq_len, block_size):
+        seq_lens_encoder = paddle.zeros_like(seq_lens_decoder)
+        res = fused_fapa_attention_npu(
+            decode_qkv,  
+            rope_emb,
+            cache_k,
+            cache_v,
+            seq_lens_encoder,
+            seq_lens_decoder,
+            block_tables,
+            q_num_head,
+            kv_num_head,
+            head_dim,
+            max_seq_len,
+            block_size,
+            )
+        return res
+
+    def split_pd_qkv(self, qkv):
+        for ids, reverse_ids in zip(self.prefill_info_dict["id_group"], self.prefill_info_dict["reverse_id_group"]):
+            self.prefill_qkv[ids[0] : ids[1], :] = qkv[reverse_ids[0] : reverse_ids[1], :]
+
+        for ids, reverse_ids in zip(self.decode_info_dict["id_group"], self.decode_info_dict["reverse_id_group"]):
+            self.decode_qkv[ids[0] : ids[1], :] = qkv[reverse_ids[0] : reverse_ids[1], :]
+
+        return self.prefill_qkv, self.decode_qkv
+
+    def merge_pd_output(self, prefill_out, decode_out):
+        for stage, idx in self.record_stages:
+            if stage == "prefill":
+                ids = self.prefill_info_dict["id_group"][idx]
+                reverse_ids = self.prefill_info_dict["reverse_id_group"][idx]
+                self.merged_output[reverse_ids[0] : reverse_ids[1], :] = prefill_out[ids[0] : ids[1], :]
+            else:
+                ids = self.decode_info_dict["id_group"][idx]
+                reverse_ids = self.decode_info_dict["reverse_id_group"][idx]
+                self.merged_output[reverse_ids[0] : reverse_ids[1], : ] = decode_out[ids[0] : ids[1], :]
+        return self.merged_output
 
     def forward_mixed(
         self,
@@ -193,20 +337,63 @@ class NpuFaPaAttentionBackend(AttentionBackend):
                 metadata.kv_signal_metadata, layer.layer_id + self.start_layer_index
             )
         # FIXME: guozr 这里改成bfloat16
-
+        # res = fused_fapa_attention_npu(
+        #     qkv,  
+        #     metadata.rotary_embs,
+        #     forward_meta.caches[2 * layer.layer_id],
+        #     forward_meta.caches[2 * layer.layer_id + 1],
+        #     forward_meta.seq_lens_encoder,
+        #     forward_meta.seq_lens_decoder,
+        #     metadata.block_tables,
+        #     self.num_heads,
+        #     self.kv_num_heads,
+        #     self.head_dim,
+        #     self.max_seq_len,
+        #     self.block_size,
+        # )
         
-        res = fused_fapa_attention_npu(
-            qkv,  
-            metadata.rotary_embs,
-            forward_meta.caches[2 * layer.layer_id],
-            forward_meta.caches[2 * layer.layer_id + 1],
-            forward_meta.seq_lens_encoder,
-            forward_meta.seq_lens_decoder,
-            metadata.block_tables,
-            self.num_heads,
-            self.kv_num_heads,
-            self.head_dim,
-            self.max_seq_len,
-            self.block_size,
-        )
-        return res[0]
+        # only prefill or decode 
+        if (self.decode_len == 0 or self.prefill_len == 0):
+            res = fused_fapa_attention_npu(
+                qkv,  
+                metadata.rotary_embs,
+                forward_meta.caches[2 * layer.layer_id],
+                forward_meta.caches[2 * layer.layer_id + 1],
+                forward_meta.seq_lens_encoder,
+                forward_meta.seq_lens_decoder,
+                metadata.block_tables,
+                self.num_heads,
+                self.kv_num_heads,
+                self.head_dim,
+                self.max_seq_len,
+                self.block_size,
+            )
+            return res[0]
+        else:
+            prefill_qkv, decode_qkv = self.split_pd_qkv(qkv)
+            prefill_output = self.forward_prefill(
+                prefill_qkv, 
+                metadata.rotary_embs,
+                forward_meta.caches[2 * layer.layer_id],
+                forward_meta.caches[2 * layer.layer_id + 1],
+                forward_meta.seq_lens_encoder,
+                metadata.block_tables,
+                self.num_heads,
+                self.kv_num_heads,
+                self.head_dim,
+                self.max_seq_len,
+                self.block_size)
+            decode_output = self.forward_decode(
+                decode_qkv,
+                metadata.rotary_embs,
+                forward_meta.caches[2 * layer.layer_id],
+                forward_meta.caches[2 * layer.layer_id + 1],
+                forward_meta.seq_lens_decoder,
+                metadata.block_tables,
+                self.num_heads,
+                self.kv_num_heads,
+                self.head_dim,
+                self.max_seq_len,
+                self.block_size)
+            output = self.merge_pd_output(prefill_output[0], decode_output[0])
+            return output
